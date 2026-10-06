@@ -1,6 +1,7 @@
 import path from 'node:path';
 import express from 'express';
 import { config } from './config.js';
+import { findSession, readCookie } from './lib/auth.js';
 import { HttpError } from './lib/errors.js';
 import { getSettings } from './lib/settings.js';
 import { sendSms } from './lib/sms.js';
@@ -8,9 +9,21 @@ import { adminRoutes } from './routes/admin.js';
 import { payRoutes } from './routes/pay.js';
 import { publicRoutes } from './routes/public.js';
 
-/** همهٔ وابستگی‌ها یک‌جا؛ در تست‌ها ساعت (now) و ارسال پیامک قابل جایگزینی است. */
-export function createContext({ db, now = () => new Date() }) {
-  const ctx = { db, now, settings: () => getSettings(db) };
+/** سقف تعداد درخواست‌ها (در هر بازهٔ زمانی مشخص). در تست‌ها قابل تغییر است. */
+export const DEFAULT_LIMITS = {
+  loginPerIpUser: 10, // هر IP برای هر نام کاربری، در ۱۵ دقیقه
+  loginPerUser: 20, // هر نام کاربری از مجموع همهٔ IPها، در ۱۵ دقیقه (جلوگیری از حملهٔ توزیع‌شده)
+  loginPerIp: 60, // هر IP برای همهٔ نام‌ها، در ۱۵ دقیقه
+  sensitiveAdmin: 10, // تغییر گذرواژه و کارهای حساس، در ۱۵ دقیقه
+  booking: 20, // ثبت نوبت از هر IP، در ساعت
+  lookup: 60, // دیدن/پیگیری نوبت از هر IP، در ۱۰ دقیقه
+  otpSend: 15, // درخواست کد تأیید از هر IP، در ساعت
+  otpVerify: 30, // وارد کردن کد تأیید از هر IP، در ساعت
+};
+
+/** همهٔ وابستگی‌ها یک‌جا؛ در تست‌ها ساعت (now)، ارسال پیامک و سقف‌ها قابل جایگزینی است. */
+export function createContext({ db, now = () => new Date(), limits = {} }) {
+  const ctx = { db, now, limits: { ...DEFAULT_LIMITS, ...limits }, settings: () => getSettings(db) };
   ctx.sendSms = (args) => sendSms(ctx, args);
   return ctx;
 }
@@ -60,6 +73,12 @@ export function createApp(ctx) {
   app.use('/pay', payRoutes(ctx));
 
   const pub = config.publicDir;
+  // کد صفحه‌های پنل فقط برای مدیر واردشده ارسال می‌شود. ساختار و مسیرهای پنل برای ناشناس‌ها لو نمی‌رود
+  // (فقط پوستهٔ ورود در /admin/ باز است). داده‌ها در هر حال پشت API و نیازمند ورود هستند.
+  app.use('/admin/pages', (req, res, next) => {
+    if (findSession(ctx.db, readCookie(req), ctx.now().getTime())) return next();
+    res.status(401).type('text/plain').send('Unauthorized');
+  });
   app.use(
     express.static(pub, {
       setHeaders(res, file) {

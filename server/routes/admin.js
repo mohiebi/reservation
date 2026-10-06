@@ -1,8 +1,9 @@
 import { Router } from 'express';
+import { audit, listAudit } from '../lib/audit.js';
 import { findSlots } from '../lib/availability.js';
 import {
-  clearSessionCookie, createSession, destroySession, findSession, hashPassword,
-  readCookie, requireAdmin, setSessionCookie, verifyPassword,
+  ROLES, clearSessionCookie, createSession, destroySession, destroySessionsOf, findSession, hashPassword,
+  passwordProblem, readCookie, requireAdmin, requireRole, sessionView, setSessionCookie, verifyPassword,
 } from '../lib/auth.js';
 import { adminView, cancelAppointment, createBooking, getAppointment, listAppointments, updateAppointment } from '../lib/booking.js';
 import { config } from '../config.js';
@@ -16,7 +17,6 @@ import * as v from '../lib/validate.js';
 import { loadService, parseStaffParam } from './public.js';
 
 const STATUSES = ['pending_payment', 'confirmed', 'completed', 'cancelled', 'no_show'];
-let dummyHash;
 
 function serviceView(row) {
   return {
@@ -64,54 +64,86 @@ function parseHours(list) {
 export function adminRoutes(ctx) {
   const { db } = ctx;
   const router = Router();
+  const nowMs = () => ctx.now().getTime();
+  const owner = requireRole('owner'); // بخش‌هایی که منشی به آن‌ها دسترسی ندارد
 
-  const loginLimiter = rateLimit({
-    windowMs: 15 * 60_000,
-    max: 10,
-    keyFn: (req) => `${req.ip}:${String(req.body?.username ?? '').toLowerCase()}`,
-    message: 'تلاش‌های ناموفق زیاد بود. ۱۵ دقیقه بعد دوباره امتحان کنید.',
-  });
+  // ---------- محدودیت تلاش ورود ----------
+  // سه لایه: هر (IP + نام کاربری)، هر نام کاربری از هر IP، و هر IP برای همه‌چیز.
+  // لایهٔ دوم جلوی حملهٔ توزیع‌شده روی یک حساب را می‌گیرد؛ لایهٔ سوم جلوی امتحان کردن فهرست بلندی از نام‌ها را.
+  const lockMsg = 'تلاش‌های ناموفق زیاد بود. ۱۵ دقیقه بعد دوباره امتحان کنید.';
+  const limiter = (max, keyFn, message = lockMsg) => rateLimit({ windowMs: 15 * 60_000, max, keyFn, message, now: nowMs });
+  const nameOf = (req) => String(req.body?.username ?? '').trim().toLowerCase().slice(0, 64);
+  const keyIpUser = (req) => `${req.ip}|${nameOf(req)}`;
+  const loginLimiters = [
+    limiter(ctx.limits.loginPerIpUser, keyIpUser),
+    limiter(ctx.limits.loginPerUser, (req) => `u|${nameOf(req)}`),
+    limiter(ctx.limits.loginPerIp, (req) => `ip|${req.ip}`),
+  ];
+  const sensitiveLimiter = limiter(ctx.limits.sensitiveAdmin, (req) => `a|${req.admin?.id}`, 'تعداد درخواست‌ها زیاد است. کمی بعد دوباره تلاش کنید.');
+
+  let dummyHash;
 
   // ---------- ورود و خروج ----------
 
   router.get('/session', (req, res) => {
-    const admin = findSession(db, readCookie(req), ctx.now().getTime());
+    const admin = findSession(db, readCookie(req), nowMs());
     const needsSetup = !db.prepare('SELECT 1 FROM admins LIMIT 1').get();
     res.json({ admin, needsSetup });
   });
 
-  router.post('/login', loginLimiter, async (req, res) => {
-    const username = String(req.body?.username ?? '').trim().toLowerCase();
-    const password = String(req.body?.password ?? '');
+  router.post('/login', loginLimiters, async (req, res) => {
+    const username = nameOf(req);
+    const password = String(req.body?.password ?? '').slice(0, 200);
     const row = db.prepare('SELECT * FROM admins WHERE username = ?').get(username);
     dummyHash ??= await hashPassword('dummy-password');
     const ok = await verifyPassword(password, row?.password_hash ?? dummyHash); // زمان پاسخ برای کاربر ناموجود هم یکسان است
-    if (!row || !ok) throw unauthorized('نام کاربری یا گذرواژه درست نیست.');
-    const { token, expiresAt } = createSession(db, row.id, ctx.now().getTime(), config.sessionDays);
+    // حساب غیرفعال هم همان پیام عمومی را می‌گیرد تا وجود یا غیرفعال بودن حساب لو نرود
+    if (!row || !ok || !row.active) {
+      audit(ctx, { ip: req.ip, action: 'login_failed', detail: username });
+      throw unauthorized('نام کاربری یا گذرواژه درست نیست.');
+    }
+    loginLimiters[0].reset(keyIpUser(req));
+    const { token, expiresAt } = createSession(db, row.id, nowMs());
+    db.prepare('UPDATE admins SET last_login_at = ? WHERE id = ?').run(ctx.now().toISOString(), row.id);
     setSessionCookie(res, token, expiresAt, config.cookieSecure);
-    res.json({ admin: { id: row.id, username: row.username, name: row.name } });
+    audit(ctx, { admin: row, ip: req.ip, action: 'login_ok' });
+    res.json({ admin: sessionView(row) });
   });
 
   router.post('/logout', (req, res) => {
-    destroySession(db, readCookie(req));
+    const token = readCookie(req);
+    const admin = findSession(db, token, nowMs());
+    destroySession(db, token);
     clearSessionCookie(res);
+    if (admin) audit(ctx, { admin, ip: req.ip, action: 'logout' });
     res.json({ ok: true });
   });
 
   // ---------- از اینجا به بعد ورود لازم است ----------
-  router.use(requireAdmin(ctx));
+  // مدیری که باید گذرواژهٔ موقتش را عوض کند فقط به /password دسترسی دارد.
+  router.use(requireAdmin(ctx, { allowDuringPasswordChange: ['/password'] }));
 
-  router.post('/password', async (req, res) => {
-    const current = String(req.body?.current ?? '');
-    const next = String(req.body?.next ?? '');
-    if (next.length < 8) throw badRequest('گذرواژهٔ جدید باید حداقل ۸ حرف باشد.');
+  router.post('/password', sensitiveLimiter, async (req, res) => {
+    const current = String(req.body?.current ?? '').slice(0, 200);
+    const next = String(req.body?.next ?? '').slice(0, 200);
     const row = db.prepare('SELECT * FROM admins WHERE id = ?').get(req.admin.id);
     if (!(await verifyPassword(current, row.password_hash))) throw badRequest('گذرواژهٔ فعلی درست نیست.');
-    db.prepare('UPDATE admins SET password_hash = ? WHERE id = ?').run(await hashPassword(next), row.id);
-    // همهٔ نشست‌های قبلی بسته می‌شوند و یک نشست تازه برای همین مرورگر صادر می‌شود
-    db.prepare('DELETE FROM sessions WHERE admin_id = ?').run(row.id);
-    const { token, expiresAt } = createSession(db, row.id, ctx.now().getTime(), config.sessionDays);
+    const problem = passwordProblem(next, row.username);
+    if (problem) throw badRequest(problem);
+    if (next === current) throw badRequest('گذرواژهٔ جدید باید با گذرواژهٔ فعلی فرق داشته باشد.');
+    db.prepare('UPDATE admins SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(await hashPassword(next), row.id);
+    // همهٔ نشست‌های قبلی (از جمله دستگاه‌های دیگر) بسته می‌شوند و برای همین مرورگر نشست تازه‌ای صادر می‌شود
+    destroySessionsOf(db, row.id);
+    const { token, expiresAt } = createSession(db, row.id, nowMs());
     setSessionCookie(res, token, expiresAt, config.cookieSecure);
+    audit(ctx, { admin: req.admin, ip: req.ip, action: 'password_changed' });
+    res.json({ ok: true });
+  });
+
+  /** خروج از همهٔ دستگاه‌ها به‌جز همین مرورگر */
+  router.post('/logout-all', (req, res) => {
+    destroySessionsOf(db, req.admin.id, req.sessionToken);
+    audit(ctx, { admin: req.admin, ip: req.ip, action: 'logout_all' });
     res.json({ ok: true });
   });
 
@@ -190,7 +222,7 @@ export function adminRoutes(ctx) {
     res.json({ services: db.prepare(`${SERVICE_SELECT} ORDER BY s.sort_order, s.id`).all().map(serviceView) });
   });
 
-  router.post('/services', (req, res) => {
+  router.post('/services', owner, (req, res) => {
     const s = parseService(req.body ?? {});
     const max = db.prepare('SELECT COALESCE(MAX(sort_order), 0) AS m FROM services').get().m;
     const r = db
@@ -199,7 +231,7 @@ export function adminRoutes(ctx) {
     res.status(201).json({ service: serviceView(db.prepare(`${SERVICE_SELECT} WHERE s.id = ?`).get(Number(r.lastInsertRowid))) });
   });
 
-  router.put('/services/:id', (req, res) => {
+  router.put('/services/:id', owner, (req, res) => {
     const id = v.int(req.params.id, 'خدمت', { min: 1 });
     const s = parseService(req.body ?? {});
     const r = db
@@ -209,7 +241,7 @@ export function adminRoutes(ctx) {
     res.json({ service: serviceView(db.prepare(`${SERVICE_SELECT} WHERE s.id = ?`).get(id)) });
   });
 
-  router.delete('/services/:id', (req, res) => {
+  router.delete('/services/:id', owner, (req, res) => {
     const id = v.int(req.params.id, 'خدمت', { min: 1 });
     if (db.prepare('SELECT 1 FROM appointments WHERE service_id = ? LIMIT 1').get(id)) {
       throw conflict('برای این خدمت نوبت ثبت شده است. به‌جای حذف، آن را غیرفعال کنید.');
@@ -262,17 +294,17 @@ export function adminRoutes(ctx) {
     res.json({ staff: db.prepare('SELECT * FROM staff ORDER BY sort_order, id').all().map(staffView) });
   });
 
-  router.post('/staff', (req, res) => {
+  router.post('/staff', owner, (req, res) => {
     const id = saveStaff(null, req.body ?? {});
     res.status(201).json({ staff: staffView(db.prepare('SELECT * FROM staff WHERE id = ?').get(id)) });
   });
 
-  router.put('/staff/:id', (req, res) => {
+  router.put('/staff/:id', owner, (req, res) => {
     const id = saveStaff(v.int(req.params.id, 'پرسنل', { min: 1 }), req.body ?? {});
     res.json({ staff: staffView(db.prepare('SELECT * FROM staff WHERE id = ?').get(id)) });
   });
 
-  router.delete('/staff/:id', (req, res) => {
+  router.delete('/staff/:id', owner, (req, res) => {
     const id = v.int(req.params.id, 'پرسنل', { min: 1 });
     if (db.prepare('SELECT 1 FROM appointments WHERE staff_id = ? LIMIT 1').get(id)) {
       throw conflict('برای این فرد نوبت ثبت شده است. به‌جای حذف، او را غیرفعال کنید.');
@@ -298,7 +330,7 @@ export function adminRoutes(ctx) {
     };
   }
 
-  router.get('/timeoff', (_req, res) => {
+  router.get('/timeoff', owner, (_req, res) => {
     const today = localNow(ctx.now(), ctx.settings().timezone).date;
     const rows = db
       .prepare(
@@ -309,7 +341,7 @@ export function adminRoutes(ctx) {
     res.json({ timeOff: rows.map(timeOffView) });
   });
 
-  router.post('/timeoff', (req, res) => {
+  router.post('/timeoff', owner, (req, res) => {
     const b = req.body ?? {};
     const staffId = b.staffId == null || b.staffId === '' ? null : v.int(b.staffId, 'پرسنل', { min: 1 });
     if (staffId != null && !db.prepare('SELECT 1 FROM staff WHERE id = ?').get(staffId)) throw badRequest('پرسنل معتبر نیست.');
@@ -342,7 +374,7 @@ export function adminRoutes(ctx) {
     res.status(201).json({ timeOff: timeOffView(row), conflicts: clash });
   });
 
-  router.delete('/timeoff/:id', (req, res) => {
+  router.delete('/timeoff/:id', owner, (req, res) => {
     db.prepare('DELETE FROM time_off WHERE id = ?').run(v.int(req.params.id, 'مورد', { min: 1 }));
     res.json({ ok: true });
   });
@@ -390,21 +422,105 @@ export function adminRoutes(ctx) {
 
   // ---------- پیامک و تنظیمات ----------
 
-  router.get('/sms', (_req, res) => {
+  router.get('/sms', owner, (_req, res) => {
     res.json({ sms: db.prepare('SELECT * FROM sms_log ORDER BY id DESC LIMIT 100').all() });
   });
 
-  router.get('/settings', (_req, res) => {
+  router.get('/settings', owner, (_req, res) => {
     res.json({ settings: adminSettingsView(getSettings(db)) });
   });
 
-  router.put('/settings', (req, res) => {
+  router.put('/settings', owner, (req, res) => {
+    const before = getSettings(db);
     try {
       updateSettings(db, req.body?.settings ?? req.body);
     } catch (err) {
       throw new HttpError(400, err.message);
     }
-    res.json({ settings: adminSettingsView(getSettings(db)) });
+    const after = getSettings(db);
+    const changed = Object.keys(after).filter((k) => JSON.stringify(after[k]) !== JSON.stringify(before[k]));
+    // فقط نام کلیدهای تغییرکرده ثبت می‌شود، نه مقدارها (کلیدهای API محرمانه‌اند)
+    if (changed.length) audit(ctx, { admin: req.admin, ip: req.ip, action: 'settings_changed', detail: changed.join(', ') });
+    res.json({ settings: adminSettingsView(after) });
+  });
+
+  // ---------- کاربران پنل و گزارش امنیتی (فقط مدیر کل) ----------
+
+  const userView = (r) => ({
+    id: r.id, username: r.username, name: r.name, role: r.role,
+    active: Boolean(r.active), mustChangePassword: Boolean(r.must_change_password), lastLoginAt: r.last_login_at,
+  });
+  const otherActiveOwners = (exceptId) =>
+    db.prepare(`SELECT COUNT(*) AS n FROM admins WHERE role = 'owner' AND active = 1 AND id != ?`).get(exceptId).n;
+
+  router.get('/users', owner, (_req, res) => {
+    res.json({ users: db.prepare('SELECT * FROM admins ORDER BY id').all().map(userView), roles: ROLES });
+  });
+
+  router.post('/users', owner, sensitiveLimiter, async (req, res) => {
+    const b = req.body ?? {};
+    const username = v.text(b.username, 'نام کاربری', { min: 3, max: 32 }).toLowerCase();
+    if (!/^[a-z0-9_.-]+$/.test(username)) throw badRequest('نام کاربری فقط شامل حروف انگلیسی، عدد و ._- باشد.');
+    const name = v.text(b.name, 'نام', { min: 2, max: 60 });
+    const role = v.oneOf(b.role, Object.keys(ROLES), 'نقش');
+    const password = String(b.password ?? '').slice(0, 200);
+    const problem = passwordProblem(password, username);
+    if (problem) throw badRequest(problem);
+    if (db.prepare('SELECT 1 FROM admins WHERE username = ?').get(username)) throw conflict('این نام کاربری قبلاً ثبت شده است.');
+    // گذرواژهٔ تعیین‌شده توسط مدیر موقتی است؛ کاربر در اولین ورود باید آن را عوض کند
+    const r = db
+      .prepare('INSERT INTO admins (username, name, role, password_hash, must_change_password, created_at) VALUES (?, ?, ?, ?, 1, ?)')
+      .run(username, name, role, await hashPassword(password), ctx.now().toISOString());
+    audit(ctx, { admin: req.admin, ip: req.ip, action: 'user_created', detail: `${username} (${role})` });
+    res.status(201).json({ user: userView(db.prepare('SELECT * FROM admins WHERE id = ?').get(Number(r.lastInsertRowid))) });
+  });
+
+  router.put('/users/:id', owner, (req, res) => {
+    const id = v.int(req.params.id, 'کاربر', { min: 1 });
+    const target = db.prepare('SELECT * FROM admins WHERE id = ?').get(id);
+    if (!target) throw notFound('کاربر پیدا نشد.');
+    const b = req.body ?? {};
+    const name = v.text(b.name ?? target.name, 'نام', { min: 2, max: 60 });
+    const role = v.oneOf(b.role ?? target.role, Object.keys(ROLES), 'نقش');
+    const active = b.active === undefined ? Boolean(target.active) : v.bool(b.active);
+    const sensitiveChange = role !== target.role || active !== Boolean(target.active);
+    if (sensitiveChange && id === req.admin.id) throw conflict('نقش یا وضعیت حساب خودتان را نمی‌توانید تغییر دهید.');
+    if (target.role === 'owner' && (role !== 'owner' || !active) && otherActiveOwners(id) === 0) {
+      throw conflict('باید دست‌کم یک مدیر کل فعال باقی بماند.');
+    }
+    tx(db, () => {
+      db.prepare('UPDATE admins SET name = ?, role = ?, active = ? WHERE id = ?').run(name, role, active ? 1 : 0, id);
+      if (sensitiveChange) destroySessionsOf(db, id); // تغییر نقش یا غیرفعال‌سازی فوراً اعمال می‌شود
+    });
+    const changes = [
+      role !== target.role && `role ${target.role}→${role}`,
+      active !== Boolean(target.active) && (active ? 'activated' : 'deactivated'),
+      name !== target.name && 'name',
+    ].filter(Boolean).join(', ');
+    audit(ctx, { admin: req.admin, ip: req.ip, action: 'user_updated', detail: `${target.username}: ${changes || 'no change'}` });
+    res.json({ user: userView(db.prepare('SELECT * FROM admins WHERE id = ?').get(id)) });
+  });
+
+  /** تعیین گذرواژهٔ موقت جدید برای یک کاربر دیگر؛ او باید در ورود بعدی آن را عوض کند */
+  router.post('/users/:id/password', owner, sensitiveLimiter, async (req, res) => {
+    const id = v.int(req.params.id, 'کاربر', { min: 1 });
+    const target = db.prepare('SELECT * FROM admins WHERE id = ?').get(id);
+    if (!target) throw notFound('کاربر پیدا نشد.');
+    if (id === req.admin.id) throw conflict('گذرواژهٔ خودتان را از «حساب من» تغییر دهید.');
+    const password = String(req.body?.password ?? '').slice(0, 200);
+    const problem = passwordProblem(password, target.username);
+    if (problem) throw badRequest(problem);
+    const hash = await hashPassword(password);
+    tx(db, () => {
+      db.prepare('UPDATE admins SET password_hash = ?, must_change_password = 1 WHERE id = ?').run(hash, id);
+      destroySessionsOf(db, id);
+    });
+    audit(ctx, { admin: req.admin, ip: req.ip, action: 'user_password_reset', detail: target.username });
+    res.json({ ok: true });
+  });
+
+  router.get('/audit', owner, (_req, res) => {
+    res.json({ events: listAudit(db, 150) });
   });
 
   return router;

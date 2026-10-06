@@ -92,9 +92,11 @@ export const statusBadge = (status) => h('span', { class: `badge ${status}` }, S
 // ---------- شبکه ----------
 
 export class ApiError extends Error {
-  constructor(status, message) {
+  constructor(status, message, data = {}) {
     super(message);
     this.status = status;
+    this.code = data?.code; // مثلاً password_change_required
+    this.data = data ?? {}; // مثلاً retryAfterSec
   }
 }
 
@@ -114,7 +116,8 @@ export async function api(path, { method = 'GET', body } = {}) {
   if (res.status === 401 && path.startsWith('/api/admin/') && !/\/(login|session)$/.test(path)) {
     window.dispatchEvent(new Event('session-expired')); // پنل مدیریت به صفحهٔ ورود برمی‌گردد
   }
-  if (!res.ok) throw new ApiError(res.status, data?.error || 'خطای ناشناخته رخ داد.');
+  if (res.status === 403 && data?.code === 'password_change_required') window.dispatchEvent(new Event('password-change-required'));
+  if (!res.ok) throw new ApiError(res.status, data?.error || 'خطای ناشناخته رخ داد.', data);
   return data;
 }
 

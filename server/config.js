@@ -14,5 +14,6 @@ export const config = {
   // پشت Nginx/Cloudflare مقدار TRUST_PROXY=1 بگذارید تا IP واقعی کاربر خوانده شود.
   trustProxy: process.env.TRUST_PROXY ? Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY : false,
   cookieSecure: process.env.COOKIE_SECURE === 'true',
-  sessionDays: 7,
+  sessionDays: 7, // حداکثر عمر نشست
+  sessionIdleHours: 8, // اگر این مدت از پنل استفاده نشود، نشست بسته می‌شود
 };

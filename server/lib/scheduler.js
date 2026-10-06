@@ -1,5 +1,7 @@
+import { pruneAudit } from './audit.js';
 import { purgeExpiredSessions } from './auth.js';
 import { expireHolds } from './booking.js';
+import { purgeOldOtps } from './otp.js';
 import { notifyAppointment } from './sms.js';
 import { addDays, epochMinutes, localNow } from './time.js';
 
@@ -10,6 +12,8 @@ export function runMaintenance(ctx) {
 
   expireHolds(ctx);
   purgeExpiredSessions(ctx.db, nowDate.getTime());
+  purgeOldOtps(ctx.db, nowDate.getTime());
+  pruneAudit(ctx.db);
 
   if (!settings.sms_enabled || settings.reminder_hours <= 0) return;
 

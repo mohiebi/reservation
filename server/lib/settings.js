@@ -30,6 +30,7 @@ export const DEFAULTS = {
   sms_tpl_confirm: 'سلام {name}، نوبت شما برای {service} در {business} ثبت شد.\n{weekday} {date} ساعت {time}\nکد پیگیری: {code}\n{link}',
   sms_tpl_reminder: 'سلام {name}، یادآوری نوبت {service} در {business}:\n{weekday} {date} ساعت {time}\n{link}',
   sms_tpl_cancel: 'سلام {name}، نوبت {service} شما در {business} ({date} ساعت {time}) لغو شد.',
+  sms_tpl_otp: 'کد تأیید لغو نوبت در {business}: {code}\nاین کد را در اختیار دیگران قرار ندهید.',
 };
 
 /** این کلیدها هرگز به مرورگر برگردانده نمی‌شوند */

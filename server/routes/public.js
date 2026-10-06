@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { datesWithSlots, findSlots, qualifiedStaff } from '../lib/availability.js';
-import { cancelAppointment, cancelByCustomer, createBooking, getAppointmentByCode, publicView } from '../lib/booking.js';
-import { HttpError, badRequest, notFound } from '../lib/errors.js';
+import { audit } from '../lib/audit.js';
+import { cancelAppointment, canCustomerCancel, cancelByCustomer, createBooking, getAppointmentByCode, publicView } from '../lib/booking.js';
+import { HttpError, badRequest, conflict, notFound } from '../lib/errors.js';
 import { MONTH_NAMES, WEEKDAY_NAMES, isoToJalali, monthGrid } from '../lib/jalali.js';
+import { requestCancelOtp, verifyCancelOtp } from '../lib/otp.js';
 import { startPayment } from '../lib/payment.js';
 import { rateLimit } from '../lib/ratelimit.js';
 import { addDays, localNow, minToHHMM } from '../lib/time.js';
@@ -23,8 +25,11 @@ export function loadService(ctx, id, { activeOnly = true } = {}) {
 export function publicRoutes(ctx) {
   const router = Router();
 
-  const bookingLimiter = rateLimit({ windowMs: 3600_000, max: 20, message: 'تعداد ثبت نوبت از این شبکه زیاد است. کمی بعد دوباره تلاش کنید.' });
-  const lookupLimiter = rateLimit({ windowMs: 600_000, max: 60 });
+  const now = () => ctx.now().getTime();
+  const bookingLimiter = rateLimit({ windowMs: 3600_000, max: ctx.limits.booking, now, message: 'تعداد ثبت نوبت از این شبکه زیاد است. کمی بعد دوباره تلاش کنید.' });
+  const lookupLimiter = rateLimit({ windowMs: 600_000, max: ctx.limits.lookup, now });
+  const otpSendLimiter = rateLimit({ windowMs: 3600_000, max: ctx.limits.otpSend, now, message: 'تعداد درخواست کد از این شبکه زیاد است. کمی بعد دوباره تلاش کنید.' });
+  const otpVerifyLimiter = rateLimit({ windowMs: 3600_000, max: ctx.limits.otpVerify, now, message: 'تعداد تلاش‌ها زیاد است. کمی بعد دوباره تلاش کنید.' });
 
   router.get('/config', (_req, res) => {
     const s = ctx.settings();
@@ -121,9 +126,37 @@ export function publicRoutes(ctx) {
     res.json({ booking: publicView(ctx, byCode(req)) });
   });
 
-  router.post('/bookings/:code/cancel', lookupLimiter, (req, res) => {
+  /** قانون زمانی لغو (مثلاً ۱۲ ساعت قبل). پیش از ارسال یا مصرف کد بررسی می‌شود تا کد بی‌دلیل خرج نشود. */
+  const assertCancellable = (a) => {
+    if (!canCustomerCancel(ctx, a)) {
+      throw conflict(`لغو آنلاین فقط تا ${ctx.settings().cancel_before_hours} ساعت قبل از نوبت ممکن است. لطفاً با ما تماس بگیرید.`);
+    }
+  };
+
+  /**
+   * مرحلهٔ ۱ لغو: ارسال کد تأیید به شمارهٔ ثبت‌شده در خود نوبت.
+   * کد پیگیری به‌تنهایی کافی نیست؛ فقط صاحب آن شمارهٔ موبایل می‌تواند نوبت را لغو کند.
+   */
+  router.post('/bookings/:code/cancel-code', otpSendLimiter, async (req, res) => {
     const a = byCode(req);
+    assertCancellable(a);
+    const sent = await requestCancelOtp(ctx, a);
+    audit(ctx, { ip: req.ip, action: 'cancel_code_sent', detail: a.code });
+    res.json(sent);
+  });
+
+  /** مرحلهٔ ۲ لغو: با کد تأیید پیامکی. */
+  router.post('/bookings/:code/cancel', otpVerifyLimiter, (req, res) => {
+    const a = byCode(req);
+    assertCancellable(a);
+    try {
+      verifyCancelOtp(ctx, a, req.body?.otp);
+    } catch (err) {
+      audit(ctx, { ip: req.ip, action: 'cancel_code_failed', detail: a.code });
+      throw err;
+    }
     cancelByCustomer(ctx, a.code);
+    audit(ctx, { ip: req.ip, action: 'cancelled_by_customer', detail: a.code });
     res.json({ booking: publicView(ctx, byCode(req)) });
   });
 

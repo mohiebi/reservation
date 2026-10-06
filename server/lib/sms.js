@@ -21,15 +21,21 @@ async function kavenegarSend(settings, phone, body) {
   if (!res.ok || data?.return?.status !== 200) throw new Error(data?.return?.message || `HTTP ${res.status}`);
 }
 
-/** پیامک می‌فرستد و همیشه نتیجه را در sms_log ثبت می‌کند. هرگز خطا نمی‌اندازد. */
-export async function sendSms(ctx, { phone, kind, body }) {
+/**
+ * پیامک می‌فرستد و همیشه نتیجه را در sms_log ثبت می‌کند. هرگز خطا نمی‌اندازد.
+ * logBody: اگر داده شود به‌جای متن اصلی در گزارش ذخیره می‌شود (برای پیامک‌هایی که حاوی کد محرمانه‌اند).
+ */
+export async function sendSms(ctx, { phone, kind, body, logBody }) {
   const settings = ctx.settings();
   if (!settings.sms_enabled) return { status: 'disabled' };
   let status = 'sent';
   let error = '';
   try {
     if (settings.sms_provider === 'kavenegar') await kavenegarSend(settings, phone, body);
-    else status = 'simulated'; // حالت آزمایشی: فقط در لاگ ثبت می‌شود
+    else {
+      status = 'simulated'; // حالت آزمایشی: ارسال نمی‌شود؛ فقط برای توسعه در کنسول سرور چاپ می‌شود
+      console.log(`[پیامک آزمایشی → ${phone}] ${body}`);
+    }
   } catch (err) {
     status = 'failed';
     error = String(err?.message ?? err).slice(0, 300);
@@ -37,7 +43,7 @@ export async function sendSms(ctx, { phone, kind, body }) {
   try {
     ctx.db
       .prepare('INSERT INTO sms_log (phone, kind, body, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(phone, kind, body, status, error, ctx.now().toISOString());
+      .run(phone, kind, logBody ?? body, status, error, ctx.now().toISOString());
   } catch (err) {
     console.error('sms_log write failed:', err);
   }

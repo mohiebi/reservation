@@ -1,14 +1,18 @@
 import { $, ApiError, api, applyBrand, field, guarded, h, icon, showSpinner, toast } from '/js/common.js';
+import { ROLE_LABEL, openAccount, passwordForm } from './account.js';
 
+// owner: true یعنی فقط برای مدیر کل (سرور هم همین را اعمال می‌کند؛ اینجا فقط منو را مرتب می‌کنیم)
 const PAGES = [
   { id: 'appointments', label: 'نوبت‌ها' },
-  { id: 'services', label: 'خدمات' },
-  { id: 'staff', label: 'پرسنل' },
-  { id: 'timeoff', label: 'مرخصی و تعطیلات' },
+  { id: 'services', label: 'خدمات', owner: true },
+  { id: 'staff', label: 'پرسنل', owner: true },
+  { id: 'timeoff', label: 'مرخصی و تعطیلات', owner: true },
   { id: 'customers', label: 'مشتریان' },
-  { id: 'sms', label: 'پیامک‌ها' },
-  { id: 'settings', label: 'تنظیمات' },
+  { id: 'sms', label: 'پیامک‌ها', owner: true },
+  { id: 'users', label: 'کاربران و امنیت', owner: true },
+  { id: 'settings', label: 'تنظیمات', owner: true },
 ];
+const allowedPages = () => PAGES.filter((p) => !p.owner || app.admin?.role === 'owner');
 
 const app = { config: null, admin: null };
 const root = $('#root');
@@ -52,10 +56,25 @@ function renderLogin(needsSetup) {
   root.replaceChildren(h('div', { class: 'login' }, form));
 }
 
+// ---------- تغییر اجباری گذرواژهٔ موقت ----------
+
+function renderForcedPasswordChange() {
+  document.title = 'تعیین گذرواژهٔ جدید';
+  const form = passwordForm({ onDone: boot, submitLabel: 'ذخیره و ورود به پنل' });
+  root.replaceChildren(
+    h('div', { class: 'login' },
+      h('div', { class: 'card' },
+        h('div', {}, h('h1', {}, 'تعیین گذرواژهٔ جدید'), h('p', { class: 'muted' }, `سلام ${app.admin.name}`)),
+        h('div', { class: 'notice warn' }, 'گذرواژهٔ فعلی شما موقتی است و مدیر آن را می‌داند. برای ادامه، گذرواژهٔ شخصی خودتان را تعیین کنید.'),
+        form.el,
+        h('button', { class: 'btn ghost', type: 'button', onclick: logout }, 'خروج'))));
+  form.focus();
+}
+
 // ---------- قاب اصلی ----------
 
 function renderShell() {
-  const links = PAGES.map((p) => h('a', { href: `#/${p.id}`, dataset: { page: p.id } }, p.label));
+  const links = allowedPages().map((p) => h('a', { href: `#/${p.id}`, dataset: { page: p.id } }, p.label));
   root.replaceChildren(
     h(
       'div',
@@ -69,6 +88,7 @@ function renderShell() {
           'div',
           { class: 'side-foot' },
           h('a', { href: '/', target: '_blank', rel: 'noopener' }, icon('calendar'), h('span', { class: 'txt' }, 'صفحهٔ رزرو مشتری')),
+          h('button', { type: 'button', onclick: () => openAccount(app) }, icon('user'), h('span', { class: 'txt' }, `حساب من · ${ROLE_LABEL[app.admin.role] ?? ''}`)),
           h('button', { type: 'button', onclick: logout }, icon('logout'), h('span', { class: 'txt' }, `خروج (${app.admin.username})`)),
         ),
       ),
@@ -86,7 +106,9 @@ async function logout() {
 
 async function route() {
   if (!app.admin) return;
-  const id = PAGES.some((p) => p.id === location.hash.slice(2)) ? location.hash.slice(2) : 'appointments';
+  // صفحه‌ای که این نقش به آن دسترسی ندارد به «نوبت‌ها» برمی‌گردد (سرور هم دسترسی را رد می‌کند)
+  const requested = location.hash.slice(2);
+  const id = allowedPages().some((p) => p.id === requested) ? requested : 'appointments';
   const page = PAGES.find((p) => p.id === id);
   for (const a of document.querySelectorAll('.nav a')) {
     if (a.dataset.page === id) a.setAttribute('aria-current', 'page');
@@ -105,7 +127,7 @@ async function route() {
     container.replaceChildren(...fragment.childNodes);
   } catch (err) {
     if (token !== renderToken) return;
-    if (err instanceof ApiError && err.status === 401) return renderLogin(false);
+    if (err instanceof ApiError && (err.status === 401 || err.code === 'password_change_required')) return; // رویدادهای سراسری رسیدگی می‌کنند
     console.error(err);
     container.replaceChildren(h('div', { class: 'form-error', role: 'alert' }, err.message));
   }
@@ -118,6 +140,7 @@ async function boot() {
     applyBrand(config.brandColor);
     if (!session.admin) return renderLogin(session.needsSetup);
     app.admin = session.admin;
+    if (session.admin.mustChangePassword) return renderForcedPasswordChange();
     renderShell();
     route();
   } catch (err) {
@@ -126,6 +149,12 @@ async function boot() {
 }
 
 window.addEventListener('hashchange', route);
+window.addEventListener('password-change-required', () => {
+  if (app.admin && !app.admin.mustChangePassword) {
+    app.admin.mustChangePassword = true;
+    renderForcedPasswordChange();
+  }
+});
 window.addEventListener('session-expired', () => {
   if (app.admin) {
     app.admin = null;

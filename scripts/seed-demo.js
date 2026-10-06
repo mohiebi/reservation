@@ -47,7 +47,7 @@ await (async () => {
       for (const idx of st.serviceIdx) db.prepare('INSERT INTO staff_services (staff_id, service_id) VALUES (?, ?)').run(id, serviceIds[idx]);
       for (const [weekday, s, e] of weekHours) db.prepare('INSERT INTO working_hours (staff_id, weekday, start_min, end_min) VALUES (?, ?, ?, ?)').run(id, weekday, s, e);
     });
-    db.prepare('INSERT OR REPLACE INTO admins (username, name, password_hash, created_at) VALUES (?, ?, ?, ?)').run('demo', 'مدیر نمونه', hash, new Date().toISOString());
+    db.prepare("INSERT OR REPLACE INTO admins (username, name, role, password_hash, created_at) VALUES (?, ?, 'owner', ?, ?)").run('demo', 'مدیر نمونه', hash, new Date().toISOString());
   });
 })();
 

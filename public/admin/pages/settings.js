@@ -45,6 +45,7 @@ const SECTIONS = [
       ['sms_tpl_confirm', 'متن پیامک تأیید نوبت', 'textarea', 'متغیرها: {name} {service} {business} {date} {weekday} {time} {code} {link}', (v) => v.sms_enabled],
       ['sms_tpl_reminder', 'متن پیامک یادآوری', 'textarea', null, (v) => v.sms_enabled],
       ['sms_tpl_cancel', 'متن پیامک لغو', 'textarea', null, (v) => v.sms_enabled],
+      ['sms_tpl_otp', 'متن پیامک کد تأیید لغو نوبت', 'textarea', 'حتماً {code} را نگه دارید. این پیامک تنها راه تأیید هویت مشتری هنگام لغو آنلاین است؛ اگر پیامک خاموش باشد مشتری باید برای لغو تماس بگیرد.', (v) => v.sms_enabled],
     ],
   },
 ];
@@ -133,27 +134,11 @@ export async function render(root, app) {
     }),
   );
 
-  // ---------- تغییر گذرواژه ----------
-  const cur = h('input', { class: 'input', type: 'password', dir: 'ltr', autocomplete: 'current-password' });
-  const nxt = h('input', { class: 'input', type: 'password', dir: 'ltr', autocomplete: 'new-password' });
-  const rep = h('input', { class: 'input', type: 'password', dir: 'ltr', autocomplete: 'new-password' });
-  const changePw = h('button', { class: 'btn', type: 'button' }, 'تغییر گذرواژه');
-  changePw.addEventListener('click', () =>
-    guarded(changePw, async () => {
-      if (nxt.value !== rep.value) return toast('تکرار گذرواژه با گذرواژهٔ جدید یکسان نیست.', 'bad');
-      await api('/api/admin/password', { method: 'POST', body: { current: cur.value, next: nxt.value } });
-      cur.value = nxt.value = rep.value = '';
-      toast('گذرواژه تغییر کرد.', 'ok');
-    }),
-  );
-
   root.append(
     h('div', { class: 'page-head' }, h('h1', {}, 'تنظیمات')),
     h('div', { class: 'stack' },
       warn, ...cards,
       h('div', { class: 'save-bar' }, save),
-      h('section', { class: 'card settings-card' }, h('h2', {}, 'حساب کاربری'),
-        field('گذرواژهٔ فعلی', cur), h('div', { class: 'form-grid' }, field('گذرواژهٔ جدید (حداقل ۸ حرف)', nxt), field('تکرار گذرواژهٔ جدید', rep)), h('div', {}, changePw)),
     ),
   );
   refresh();

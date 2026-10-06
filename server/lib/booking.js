@@ -3,6 +3,7 @@ import { tx } from '../db.js';
 import { findSlots, hasOverlap, qualifiedStaff } from './availability.js';
 import { badRequest, conflict, notFound } from './errors.js';
 import { describeDate } from './jalali.js';
+import { maskPhone, otpAvailable } from './otp.js';
 import { notifyAppointment } from './sms.js';
 import { epochMinutes, localNow, minToHHMM } from './time.js';
 
@@ -80,7 +81,10 @@ export function canCustomerCancel(ctx, a) {
   return minutesLeft >= s.cancel_before_hours * 60;
 }
 
-/** نمایی که مشتری با کد پیگیری می‌بیند؛ شمارهٔ موبایل و یادداشت‌های داخلی در آن نیست */
+/**
+ * نمایی که هر کسی با کد پیگیری می‌بیند. نام و شمارهٔ کامل مشتری و یادداشت‌های داخلی در آن نیست؛
+ * فقط شمارهٔ ماسک‌شده می‌آید تا مشتری بداند کد تأیید به کدام شماره پیامک می‌شود.
+ */
 export function publicView(ctx, a) {
   const s = ctx.settings();
   const nowMs = ctx.now().getTime();
@@ -89,7 +93,7 @@ export function publicView(ctx, a) {
     status: a.status,
     serviceName: a.service_name,
     staffName: a.staff_name,
-    customerName: a.customer_name,
+    phoneMasked: maskPhone(a.customer_phone),
     date: a.date,
     ...describeDate(a.date),
     start: minToHHMM(a.start_min),
@@ -99,7 +103,8 @@ export function publicView(ctx, a) {
     paid: a.paid,
     amountDue: Math.max(0, a.deposit - a.paid),
     holdSecondsLeft: a.status === 'pending_payment' ? Math.max(0, Math.floor((a.hold_until - nowMs) / 1000)) : 0,
-    canCancel: canCustomerCancel(ctx, a),
+    canCancel: canCustomerCancel(ctx, a), // طبق قانون مهلت لغو
+    cancelNeedsCode: otpAvailable(s), // اگر false باشد لغو آنلاین ممکن نیست و باید تماس بگیرند
     cancelBeforeHours: s.cancel_before_hours,
     cancelPolicy: s.cancel_policy,
     business: { name: s.business_name, phone: s.business_phone, address: s.business_address },

@@ -77,23 +77,46 @@ test('مسیر عمومی: تنظیمات، خدمات، تقویم و زمان�
   assert.equal((await call('GET', `/api/public/slots?service=999&date=${SATURDAY}`)).status, 400);
 });
 
-test('رزرو کامل مشتری، پیگیری با کد و لغو', async () => {
-  const body = { serviceId: ids.serviceId, staffId: 'any', date: SATURDAY, time: '10:00', name: 'علی رضایی', phone: '۰۹۱۲۳۴۵۶۷۸۹', notes: '' };
-  const created = await call('POST', '/api/public/bookings', { body });
-  assert.equal(created.status, 201);
-  assert.equal(created.data.status, 'confirmed');
-  assert.match(created.data.code, /^[A-Z2-9]{8}$/);
+test('رزرو کامل مشتری، پیگیری با کد و لغو با کد تأیید پیامکی', async () => {
+  const { updateSettings } = await import('../server/lib/settings.js');
+  updateSettings(ctx.db, { sms_enabled: true });
+  try {
+    const body = { serviceId: ids.serviceId, staffId: 'any', date: SATURDAY, time: '10:00', name: 'علی رضایی', phone: '۰۹۱۲۳۴۵۶۷۸۹', notes: '' };
+    const created = await call('POST', '/api/public/bookings', { body });
+    assert.equal(created.status, 201);
+    assert.equal(created.data.status, 'confirmed');
+    assert.match(created.data.code, /^[A-Z2-9]{8}$/);
+    const code = created.data.code;
 
-  const view = (await call('GET', `/api/public/bookings/${created.data.code}`)).data.booking;
-  assert.equal(view.customerName, 'علی رضایی');
-  assert.equal(view.start, '10:00');
-  assert.equal(view.dateLabel, '۱۱ مهر ۱۴۰۵');
-  assert.equal(JSON.stringify(view).includes('09123456789'), false); // شماره در نمای عمومی نیست
-  assert.equal(view.canCancel, true);
+    const view = (await call('GET', `/api/public/bookings/${code}`)).data.booking;
+    assert.equal(view.start, '10:00');
+    assert.equal(view.dateLabel, '۱۱ مهر ۱۴۰۵');
+    assert.equal(view.phoneMasked, '0912***6789');
+    // نام و شمارهٔ کامل مشتری با کد پیگیری به‌تنهایی در دسترس نیست
+    assert.equal(JSON.stringify(view).includes('09123456789'), false);
+    assert.equal(JSON.stringify(view).includes('علی'), false);
+    assert.equal(view.canCancel, true);
 
-  const cancelled = await call('POST', `/api/public/bookings/${created.data.code}/cancel`, { body: {} });
-  assert.equal(cancelled.data.booking.status, 'cancelled');
-  assert.equal((await call('GET', '/api/public/bookings/ZZZZZZZZ')).status, 404);
+    // لغو بدون کد تأیید یا با کد غلط رد می‌شود
+    assert.equal((await call('POST', `/api/public/bookings/${code}/cancel`, { body: {} })).status, 400);
+    assert.equal((await call('POST', `/api/public/bookings/${code}/cancel`, { body: { otp: '000000' } })).status, 400);
+    assert.equal((await call('GET', `/api/public/bookings/${code}`)).data.booking.status, 'confirmed');
+
+    // کد به شمارهٔ ثبت‌شده در نوبت پیامک می‌شود
+    const sent = await call('POST', `/api/public/bookings/${code}/cancel-code`, { body: {} });
+    assert.equal(sent.status, 200);
+    assert.equal(sent.data.phoneMasked, '0912***6789');
+    const otpSms = ctx.sentSms.filter((m) => m.kind === 'otp').at(-1);
+    assert.equal(otpSms.phone, '09123456789');
+    const otp = /\d{6}/.exec(otpSms.body)[0];
+
+    const cancelled = await call('POST', `/api/public/bookings/${code}/cancel`, { body: { otp } });
+    assert.equal(cancelled.status, 200);
+    assert.equal(cancelled.data.booking.status, 'cancelled');
+    assert.equal((await call('GET', '/api/public/bookings/ZZZZZZZZ')).status, 404);
+  } finally {
+    updateSettings(ctx.db, { sms_enabled: false });
+  }
 });
 
 test('اعتبارسنجی ورودی رزرو', async () => {

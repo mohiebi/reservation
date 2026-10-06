@@ -3,7 +3,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 // هر مورد یک نسخهٔ مهاجرت (migration) است؛ فقط به انتهای آرایه اضافه کنید.
-const MIGRATIONS = [
+export const MIGRATIONS = [
   `
   CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
@@ -129,6 +129,36 @@ const MIGRATIONS = [
     expires_at INTEGER NOT NULL
   );
   `,
+  // نسخهٔ ۲: نقش‌ها، حساب‌های غیرفعال، تغییر اجباری گذرواژه، پایان نشست بیکار، گزارش امنیتی و کد تأیید لغو نوبت
+  `
+  ALTER TABLE admins ADD COLUMN role TEXT NOT NULL DEFAULT 'owner';
+  ALTER TABLE admins ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE admins ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE admins ADD COLUMN last_login_at TEXT;
+  ALTER TABLE sessions ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE audit_log (
+    id       INTEGER PRIMARY KEY,
+    at       TEXT NOT NULL,
+    admin_id INTEGER,
+    username TEXT NOT NULL DEFAULT '',
+    action   TEXT NOT NULL,
+    detail   TEXT NOT NULL DEFAULT '',
+    ip       TEXT NOT NULL DEFAULT ''
+  );
+
+  CREATE TABLE cancel_otps (
+    id             INTEGER PRIMARY KEY,
+    appointment_id INTEGER NOT NULL REFERENCES appointments(id) ON DELETE CASCADE,
+    salt           TEXT NOT NULL,
+    code_hash      TEXT NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    used           INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL
+  );
+  CREATE INDEX idx_cancel_otps_appt ON cancel_otps(appointment_id, id);
+  `,
 ];
 
 export function openDatabase(filePath) {
@@ -139,7 +169,7 @@ export function openDatabase(filePath) {
   return db;
 }
 
-function migrate(db) {
+export function migrate(db) {
   const current = db.prepare('PRAGMA user_version').get().user_version;
   for (let v = current; v < MIGRATIONS.length; v++) {
     db.exec('BEGIN');
